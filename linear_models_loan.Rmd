@@ -1,0 +1,928 @@
+---
+title: 'Linear Models in R: Regression & Classification'
+author: "Analytical Notebook"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+  html_document:
+    toc: true
+    toc_float: true
+  html_notebook:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+subtitle: A Comprehensive Study Using Loan Data
+---
+
+# Setup & Data Ingestion
+
+```{r setup-and-load, message=FALSE, warning=FALSE}
+# ============================================================
+#  PACKAGE LOADING
+#  Core philosophy: load everything up front so the rest of
+#  the notebook flows without interruption.
+# ============================================================
+
+# --- CRAN packages (install if missing) ---
+pkgs <- c(
+  "MASS",         # stepAIC, lda, robust regression (rlm)
+  "e1071",
+  "tidyverse",    # data wrangling + ggplot2
+  "fst",          # fast serialisation / columnar I/O (FST format)
+  "caret",        # unified ML interface: train/test splits, CV, metrics
+  "car",          # companion to Applied Regression: VIF, qqPlot, Anova
+  "lmtest",       # Breusch-Pagan, Durbin-Watson, likelihood-ratio tests
+  "sandwich",     # heteroskedasticity-consistent (HC) standard errors
+  "glmnet",       # Ridge, Lasso, Elastic-Net via coordinate descent
+  "boot",         # bootstrap confidence intervals
+  "broom",        # tidy() / glance() / augment() for model objects
+  "ggfortify",    # autoplot() for lm diagnostic plots
+  "pROC",         # ROC curves and AUC
+  "ResourceSelection", # Hosmer-Lemeshow goodness-of-fit for logistic
+  "corrplot",     # correlation matrix visualisation
+  "knitr",        # kable() for clean tables
+  "kableExtra",   # enhanced kable styling
+  "scales",       # pretty axis scales
+  "gridExtra"     # arrange multiple ggplots
+)
+
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+
+new_pkgs <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+if (length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# ============================================================
+#  GLOBAL OPTIONS
+# ============================================================
+set.seed(42)                        # reproducibility everywhere
+options(scipen = 6, digits = 4)     # suppress excessive scientific notation
+theme_set(theme_minimal(base_size = 12))  # consistent ggplot theme
+
+# ============================================================
+#  DATA INGESTION  — two paths demonstrated:
+#    1. Standard read.csv  (always available)
+#    2. FST round-trip     (blazing fast binary columnar format)
+#
+#  FST (Fast Storage) benefits:
+#    • Columnar compression  → tiny files
+#    • Multi-threaded read   → orders of magnitude faster than CSV on large data
+#    • Supports partial column reads (only load what you need)
+# ============================================================
+
+# Path 1 — the canonical CSV load as instructed
+data <- read.csv("loan_data.csv", stringsAsFactors = FALSE)
+
+# Path 2 — persist to FST format, then reload (demonstrates FST workflow)
+tmp_fst <- tempfile(fileext = ".fst")
+write_fst(data, tmp_fst, compress = 50)   # compress = 0-100; 50 is balanced
+
+# Partial-column FST read: only pull numeric columns first for speed
+numeric_cols <- names(data)[sapply(data, is.numeric)]
+data_fst_partial <- read_fst(tmp_fst, columns = numeric_cols)
+
+# Full reload from FST — this is what you'd use in production
+data <- read_fst(tmp_fst)   # replaces the CSV-loaded object
+
+cat("FST file size :", round(file.size(tmp_fst) / 1024, 1), "KB\n")
+cat("CSV file size :", round(file.size("loan_data.csv") / 1024, 1), "KB\n")
+cat("Dimensions    :", nrow(data), "rows x", ncol(data), "cols\n")
+```
+
+# Exploratory Data Analysis
+
+```{r eda-full, message=FALSE, warning=FALSE, fig.width=10, fig.height=7}
+# ============================================================
+#  SECTION 2 — UNDERSTAND THE DATA BEFORE MODELLING
+#  Rule: Never fit a model on data you haven't inspected.
+# ============================================================
+
+# --- 2.1  Structure & Summary ---
+glimpse(data)               # dplyr's structured view: types + first values
+summary(data)               # 5-number summary + NA counts per column
+
+# Count and flag missing values — critical before any imputation decision
+na_report <- data %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(n_missing / nrow(data) * 100, 2)) %>%
+  filter(n_missing > 0)
+
+if (nrow(na_report) > 0) {
+  cat("\n--- Missing Values ---\n")
+  print(kable(na_report, caption = "Missing Value Report"))
+} else {
+  cat("\nNo missing values detected.\n")
+}
+
+# --- 2.2  Identify column roles ---
+# We assume the dataset contains these typical loan-data columns.
+# Adjust `target_reg` and `target_cls` to your actual column names.
+#
+#   target_reg : continuous outcome (e.g., loan_amnt, int_rate)
+#   target_cls : binary outcome    (e.g., loan_status: 0/1 or "Default"/"Paid")
+#
+# Auto-detect a likely continuous target (largest-range numeric)
+numeric_vars  <- names(data)[sapply(data, is.numeric)]
+range_vals    <- sapply(data[numeric_vars], function(x) diff(range(x, na.rm = TRUE)))
+target_reg    <- names(which.max(range_vals))   # heuristic — change if needed
+
+# Auto-detect a likely binary target (factor/integer with 2 unique values)
+binary_candidates <- names(data)[sapply(data, function(x) length(unique(na.omit(x))) == 2)]
+target_cls <- if (length(binary_candidates) > 0) binary_candidates[1] else NULL
+
+cat("\nRegression target :", target_reg)
+cat("\nClassification target :", target_cls, "\n")
+
+# Ensure classification target is a proper factor
+if (!is.null(target_cls)) {
+  data[[target_cls]] <- factor(data[[target_cls]])
+}
+
+# --- 2.3  Univariate distributions ---
+# Histograms for all numeric variables
+p_hist <- data %>%
+  select(all_of(numeric_vars)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30, fill = "#2c7bb6", colour = "white", alpha = .85) +
+  facet_wrap(~variable, scales = "free") +
+  labs(title = "Univariate Distributions — Numeric Variables",
+       x = NULL, y = "Count")
+print(p_hist)
+
+# Bar charts for categorical / low-cardinality variables
+cat_vars <- names(data)[sapply(data, function(x) is.character(x) | is.factor(x))]
+if (length(cat_vars) > 0) {
+  p_bar <- data %>%
+    select(all_of(cat_vars)) %>%
+    pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+    count(variable, value) %>%
+    ggplot(aes(x = reorder(value, n), y = n, fill = variable)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    facet_wrap(~variable, scales = "free") +
+    labs(title = "Categorical Variable Distributions", x = NULL, y = "Count")
+  print(p_bar)
+}
+
+# --- 2.4  Correlation structure among numeric predictors ---
+cor_matrix <- cor(data[numeric_vars], use = "pairwise.complete.obs")
+corrplot(cor_matrix,
+         method  = "color",
+         type    = "upper",
+         tl.cex  = 0.75,
+         addCoef.col = "black",
+         number.cex  = 0.6,
+         title   = "Pearson Correlation Matrix",
+         mar     = c(0, 0, 2, 0))
+
+# --- 2.5  Target variable deep-dive ---
+p_target <- ggplot(data, aes_string(x = target_reg)) +
+  geom_histogram(bins = 40, fill = "#d7191c", alpha = .8) +
+  geom_vline(aes(xintercept = mean(data[[target_reg]], na.rm = TRUE)),
+             linetype = "dashed", colour = "navy", linewidth = 1) +
+  labs(title = paste("Distribution of Regression Target:", target_reg),
+       subtitle = paste("Mean =", round(mean(data[[target_reg]], na.rm=TRUE), 2),
+                        "| Median =", round(median(data[[target_reg]], na.rm=TRUE), 2),
+                        "| Skew ≈", round(e1071::skewness(data[[target_reg]], na.rm=TRUE), 3)))
+print(p_target)
+```
+
+# Data Preprocessing
+
+```{r preprocessing, message=FALSE, warning=FALSE}
+# ============================================================
+#  SECTION 3 — CLEAN, ENCODE, SPLIT, SCALE
+#  All transformations live here so modelling cells stay clean.
+# ============================================================
+
+# --- 3.1  Remove near-zero variance predictors ---
+# NZV columns add noise, inflate model complexity, and cause
+# multicollinearity.  caret::nearZeroVar() identifies them.
+nzv_idx  <- nearZeroVar(data, saveMetrics = TRUE)
+nzv_cols <- rownames(nzv_idx[nzv_idx$nzv, ])
+if (length(nzv_cols) > 0) {
+  cat("Removing near-zero variance columns:", paste(nzv_cols, collapse=", "), "\n")
+  data <- data[, !names(data) %in% nzv_cols]
+}
+
+# --- 3.2  Impute missing values (median for numeric, mode for categorical) ---
+impute_mode <- function(x) {
+  ux <- unique(x[!is.na(x)])
+  ux[which.max(tabulate(match(x[!is.na(x)], ux)))]
+}
+data <- data %>%
+  mutate(across(where(is.numeric),   ~ ifelse(is.na(.), median(., na.rm=TRUE), .))) %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), impute_mode(.), .)))
+
+# --- 3.3  Encode categorical predictors ---
+# One-hot encode using model.matrix (drops reference level automatically)
+cat_vars_remaining <- names(data)[sapply(data, function(x) is.character(x) | is.factor(x))]
+cat_vars_remaining <- setdiff(cat_vars_remaining, target_cls)  # keep target separate
+
+if (length(cat_vars_remaining) > 0) {
+  # Convert characters to factors first
+  data <- data %>% mutate(across(all_of(cat_vars_remaining), factor))
+}
+
+# --- 3.4  Log-transform skewed continuous target (if skewed) ---
+skewness_val <- e1071::skewness(data[[target_reg]], na.rm = TRUE)
+if (abs(skewness_val) > 1) {
+  cat(sprintf("Target '%s' is skewed (%.2f). Applying log1p transform.\n",
+              target_reg, skewness_val))
+  log_target <- paste0("log_", target_reg)
+  data[[log_target]] <- log1p(data[[target_reg]])
+  target_reg_model <- log_target          # use log-transformed in regression models
+} else {
+  target_reg_model <- target_reg
+}
+
+# --- 3.5  Train / Test split (80/20, stratified if possible) ---
+train_idx <- createDataPartition(
+  y     = if (!is.null(target_cls)) data[[target_cls]] else data[[target_reg_model]],
+  p     = 0.80,
+  list  = FALSE
+)
+
+train_df <- data[ train_idx, ]
+test_df  <- data[-train_idx, ]
+
+cat(sprintf("\nTrain: %d rows | Test: %d rows\n", nrow(train_df), nrow(test_df)))
+
+# --- 3.6  Scale numeric predictors (mean=0, sd=1) ---
+# Scaling is REQUIRED for regularised models (Ridge/Lasso) and
+# aids interpretability of coefficients in standard OLS too.
+# We fit the scaler ONLY on training data to avoid data leakage.
+predictors_num <- setdiff(numeric_vars, c(target_reg, target_reg_model, target_cls,
+                                           paste0("log_", target_reg)))
+predictors_num <- intersect(predictors_num, names(train_df))  # keep only columns that exist
+
+preproc_obj <- preProcess(train_df[predictors_num], method = c("center", "scale"))
+train_df[predictors_num] <- predict(preproc_obj, train_df[predictors_num])
+test_df[predictors_num]  <- predict(preproc_obj, test_df[predictors_num])   # apply TRAIN params
+
+cat("Preprocessing complete. Scaler fitted on training set only (no leakage).\n")
+```
+
+# Linear Regression — OLS & Diagnostics
+
+```{r ols-regression, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+# ============================================================
+#  SECTION 4 — ORDINARY LEAST SQUARES (OLS) REGRESSION
+#
+#  Model form:  Y = β₀ + β₁X₁ + … + βₚXₚ + ε
+#  Assumptions (LINE):
+#    L — Linearity       (residuals ~ 0 mean)
+#    I — Independence    (Durbin-Watson)
+#    N — Normality       (QQ-plot, Shapiro-Wilk)
+#    E — Equal variance  (Breusch-Pagan)
+# ============================================================
+
+# Build formula: all available numeric predictors → log-transformed target
+reg_predictors <- predictors_num   # already scaled numeric cols
+
+# Simple OLS formula
+ols_formula <- as.formula(
+  paste(target_reg_model, "~", paste(reg_predictors, collapse = " + "))
+)
+
+# --- 4.1  Fit full OLS model ---
+ols_full <- lm(ols_formula, data = train_df)
+cat("\n===== OLS FULL MODEL SUMMARY =====\n")
+print(summary(ols_full))
+
+# tidy output: coefficients + stars
+tidy_ols <- tidy(ols_full) %>%
+  mutate(significance = case_when(
+    p.value < 0.001 ~ "***",
+    p.value < 0.01  ~ "**",
+    p.value < 0.05  ~ "*",
+    p.value < 0.1   ~ ".",
+    TRUE            ~ ""
+  ))
+print(kable(tidy_ols, caption = "OLS Coefficient Table", digits = 4))
+
+# --- 4.2  Model-level fit statistics ---
+glance_ols <- glance(ols_full)
+cat("\nR²:", glance_ols$r.squared,
+    "| Adj-R²:", glance_ols$adj.r.squared,
+    "| AIC:", glance_ols$AIC,
+    "| BIC:", glance_ols$BIC, "\n")
+
+# --- 4.3  DIAGNOSTIC PLOTS ---
+# autoplot uses ggfortify to render the classic 4-panel lm diagnostics
+p_diag <- autoplot(ols_full,
+                   which  = 1:4,      # Residuals vs Fitted, QQ, Scale-Location, Cook's D
+                   colour = "#2c7bb6",
+                   smooth.colour = "#d7191c",
+                   label.size = 3) +
+  theme_minimal()
+print(p_diag)
+
+# --- 4.4  FORMAL ASSUMPTION TESTS ---
+
+# (a) Breusch-Pagan test for heteroskedasticity
+#     H₀: homoskedastic errors  |  reject if p < 0.05
+bp_test <- bptest(ols_full)
+cat("\nBreusch-Pagan test for heteroskedasticity:\n")
+print(bp_test)
+
+# (b) Durbin-Watson test for autocorrelation in residuals
+#     H₀: no autocorrelation  |  DW ≈ 2 desired
+dw_test <- dwtest(ols_full)
+cat("\nDurbin-Watson test:\n")
+print(dw_test)
+
+# (c) Shapiro-Wilk normality test on residuals (use subsample if n > 5000)
+resid_sample <- residuals(ols_full)
+if (length(resid_sample) > 5000) resid_sample <- sample(resid_sample, 5000)
+sw_test <- shapiro.test(resid_sample)
+cat("\nShapiro-Wilk normality test on residuals:\n")
+print(sw_test)
+
+# --- 4.5  MULTICOLLINEARITY — Variance Inflation Factor ---
+# VIF > 5 is concerning; VIF > 10 indicates severe multicollinearity
+tryCatch({
+  vif_vals <- vif(ols_full)
+  cat("\nVariance Inflation Factors (VIF):\n")
+  print(sort(vif_vals, decreasing = TRUE))
+  high_vif <- names(vif_vals[vif_vals > 5])
+  if (length(high_vif) > 0) {
+    cat("HIGH VIF (>5) — consider removing:", paste(high_vif, collapse=", "), "\n")
+  }
+}, error = function(e) cat("VIF computation skipped:", conditionMessage(e), "\n"))
+
+# --- 4.6  HETEROSKEDASTICITY-ROBUST STANDARD ERRORS ---
+# If BP test rejected H₀, use HC3 sandwich SEs (consistent even under heterosk.)
+if (bp_test$p.value < 0.05) {
+  cat("\nHeteroskedasticity detected — computing HC3-robust SEs:\n")
+  robust_se <- coeftest(ols_full, vcov = vcovHC(ols_full, type = "HC3"))
+  print(robust_se)
+}
+```
+
+# Model Selection & Regularisation
+
+```{r model-selection, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+# ============================================================
+#  SECTION 5 — VARIABLE SELECTION & REGULARISATION
+#
+#  Three strategies:
+#    A) Stepwise AIC  — greedy search through model space
+#    B) Ridge (L2)    — shrinks all coefficients; none to zero
+#    C) Lasso (L1)    — shrinks some to zero (built-in selection)
+#    D) Elastic Net   — blend of Ridge + Lasso (α ∈ [0,1])
+# ============================================================
+
+# --- 5.1  Stepwise selection by AIC ---
+# direction = "both" allows forward and backward steps
+cat("Running stepwise AIC selection ...\n")
+ols_step <- stepAIC(ols_full, direction = "both", trace = FALSE)
+cat("\nStepwise model formula:\n", deparse(formula(ols_step)), "\n")
+cat("AIC — Full:", AIC(ols_full), " | Stepwise:", AIC(ols_step), "\n")
+
+# --- 5.2  Prepare design matrix for glmnet ---
+# glmnet needs a plain matrix X (no formula interface)
+X_train <- model.matrix(ols_formula, data = train_df)[, -1]   # drop intercept column
+y_train <- train_df[[target_reg_model]]
+
+X_test  <- model.matrix(ols_formula, data = test_df)[, -1]
+y_test  <- test_df[[target_reg_model]]
+
+# --- 5.3  Cross-validated Ridge Regression (α = 0) ---
+cv_ridge <- cv.glmnet(X_train, y_train,
+                       alpha  = 0,      # α=0 → Ridge penalty ‖β‖²₂
+                       nfolds = 10)     # 10-fold CV to find optimal λ
+
+cat("\nRidge optimal λ (lambda.min) :", cv_ridge$lambda.min)
+cat("\nRidge optimal λ (lambda.1se) :", cv_ridge$lambda.1se, "\n")
+
+# --- 5.4  Cross-validated Lasso Regression (α = 1) ---
+cv_lasso <- cv.glmnet(X_train, y_train,
+                       alpha  = 1,      # α=1 → Lasso penalty ‖β‖₁
+                       nfolds = 10)
+
+# Variables selected by Lasso (non-zero coefficients at lambda.1se)
+lasso_coef <- coef(cv_lasso, s = "lambda.1se")
+lasso_selected <- rownames(lasso_coef)[lasso_coef[,1] != 0]
+lasso_selected <- lasso_selected[lasso_selected != "(Intercept)"]
+cat("\nLasso selected", length(lasso_selected), "predictors:\n",
+    paste(lasso_selected, collapse=", "), "\n")
+
+# --- 5.5  Elastic Net (α tuned by outer CV) ---
+alpha_grid <- seq(0, 1, by = 0.1)
+enet_models <- lapply(alpha_grid, function(a) {
+  cv.glmnet(X_train, y_train, alpha = a, nfolds = 5)
+})
+enet_cv_errors <- sapply(enet_models, function(m) min(m$cvm))
+best_alpha <- alpha_grid[which.min(enet_cv_errors)]
+cv_enet    <- enet_models[[which.min(enet_cv_errors)]]
+
+cat(sprintf("\nElastic Net best α: %.1f | λ: %.4f\n",
+            best_alpha, cv_enet$lambda.min))
+
+# --- 5.6  Visualise regularisation paths ---
+par(mfrow = c(1, 2))
+plot(cv_ridge, main = "Ridge CV")
+plot(cv_lasso, main = "Lasso CV")
+par(mfrow = c(1, 1))
+
+# Coefficient shrinkage paths
+par(mfrow = c(1, 2))
+plot(cv_ridge$glmnet.fit, xvar = "lambda",
+     main = "Ridge Coefficient Paths", label = TRUE)
+abline(v = log(cv_ridge$lambda.min), col = "red", lty = 2)
+
+plot(cv_lasso$glmnet.fit, xvar = "lambda",
+     main = "Lasso Coefficient Paths", label = TRUE)
+abline(v = log(cv_lasso$lambda.min), col = "red", lty = 2)
+par(mfrow = c(1, 1))
+
+# --- 5.7  Bootstrap confidence intervals for OLS coefficients ---
+# Bootstrap gives distribution-free CIs — robust when normality is in doubt
+boot_coef <- function(data, indices) {
+  d <- data[indices, ]
+  fit <- lm(ols_formula, data = d)
+  coef(fit)
+}
+
+cat("\nBootstrapping OLS coefficients (B=500, may take a moment) ...\n")
+boot_results <- boot(data = train_df, statistic = boot_coef, R = 500)
+boot_ci_df <- do.call(rbind, lapply(seq_along(boot_results$t0), function(i) {
+  ci <- boot.ci(boot_results, type = "perc", index = i)
+  data.frame(
+    term  = names(boot_results$t0)[i],
+    lower = ci$percent[4],
+    est   = boot_results$t0[i],
+    upper = ci$percent[5]
+  )
+}))
+
+# Plot bootstrap CIs
+ggplot(boot_ci_df[-1, ], aes(x = reorder(term, est), y = est,
+                              ymin = lower, ymax = upper)) +
+  geom_pointrange(colour = "#2c7bb6") +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  coord_flip() +
+  labs(title = "Bootstrap 95% CI for OLS Coefficients (B=500)",
+       x = NULL, y = "Coefficient estimate")
+
+# Regression Model Evaluation
+
+```{r regression-evaluation, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+# ============================================================
+#  SECTION 6 — COMPARE ALL REGRESSION MODELS ON TEST SET
+#
+#  Metrics:
+#    RMSE — Root Mean Squared Error   (lower = better; penalises outliers)
+#    MAE  — Mean Absolute Error       (lower = better; robust to outliers)
+#    R²   — Proportion variance explained (higher = better; 0–1)
+# ============================================================
+
+# Helper: compute regression metrics on test set
+reg_metrics <- function(model_obj, X_mat = NULL, newdata = NULL,
+                         y_true, model_name, is_glmnet = FALSE,
+                         lambda_val = NULL) {
+  if (is_glmnet) {
+    preds <- as.vector(predict(model_obj, newx = X_mat, s = lambda_val))
+  } else {
+    preds <- predict(model_obj, newdata = newdata)
+  }
+  resids <- y_true - preds
+  data.frame(
+    Model = model_name,
+    RMSE  = round(sqrt(mean(resids^2)), 4),
+    MAE   = round(mean(abs(resids)),     4),
+    R2    = round(1 - sum(resids^2) / sum((y_true - mean(y_true))^2), 4)
+  )
+}
+
+# Collect metrics for all regression models
+reg_comparison <- bind_rows(
+  reg_metrics(ols_full,   newdata = test_df, y_true = y_test,
+              model_name = "OLS Full"),
+  reg_metrics(ols_step,   newdata = test_df, y_true = y_test,
+              model_name = "OLS Stepwise"),
+  reg_metrics(cv_ridge, X_mat = X_test, y_true = y_test, is_glmnet = TRUE,
+              lambda_val = cv_ridge$lambda.min, model_name = "Ridge (λ.min)"),
+  reg_metrics(cv_lasso, X_mat = X_test, y_true = y_test, is_glmnet = TRUE,
+              lambda_val = cv_lasso$lambda.min, model_name = "Lasso (λ.min)"),
+  reg_metrics(cv_enet,  X_mat = X_test, y_true = y_test, is_glmnet = TRUE,
+              lambda_val = cv_enet$lambda.min,
+              model_name = paste0("Elastic Net (α=", best_alpha, ")"))
+)
+
+cat("\n===== REGRESSION MODEL COMPARISON =====\n")
+print(kable(reg_comparison, caption = "Test-Set Regression Metrics") %>%
+        kable_styling(bootstrap_options = c("striped", "hover", "condensed")))
+
+# Actual vs Predicted plot for the best model (lowest RMSE)
+best_reg_model_name <- reg_comparison$Model[which.min(reg_comparison$RMSE)]
+cat("\nBest regression model:", best_reg_model_name, "\n")
+
+# Generate predictions for best model
+if (grepl("Ridge", best_reg_model_name)) {
+  best_preds <- as.vector(predict(cv_ridge, newx = X_test, s = cv_ridge$lambda.min))
+} else if (grepl("Lasso", best_reg_model_name)) {
+  best_preds <- as.vector(predict(cv_lasso, newx = X_test, s = cv_lasso$lambda.min))
+} else if (grepl("Elastic", best_reg_model_name)) {
+  best_preds <- as.vector(predict(cv_enet,  newx = X_test, s = cv_enet$lambda.min))
+} else if (grepl("Stepwise", best_reg_model_name)) {
+  best_preds <- predict(ols_step, newdata = test_df)
+} else {
+  best_preds <- predict(ols_full, newdata = test_df)
+}
+
+pred_df <- data.frame(actual = y_test, predicted = best_preds)
+ggplot(pred_df, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.4, colour = "#2c7bb6") +
+  geom_abline(colour = "red", linewidth = 1) +
+  labs(title   = paste("Actual vs Predicted —", best_reg_model_name),
+       subtitle = paste("RMSE =", min(reg_comparison$RMSE),
+                        "| R² =", reg_comparison$R2[which.min(reg_comparison$RMSE)]),
+       x = "Actual", y = "Predicted")
+```
+
+# Logistic Regression — Classification
+
+```{r logistic-regression, message=FALSE, warning=FALSE, fig.width=10, fig.height=7}
+# ============================================================
+#  SECTION 7 — BINARY CLASSIFICATION WITH LOGISTIC REGRESSION
+#
+#  Model form:  log(p / (1-p)) = β₀ + β₁X₁ + … + βₚXₚ
+#  Interpretation: βⱼ → log-odds change per unit Xⱼ
+#                  exp(βⱼ) → odds ratio
+#
+#  Why not OLS for classification?
+#    • OLS predictions can exceed [0,1]
+#    • Error distribution is Bernoulli, not Normal
+#    • Logistic uses Maximum Likelihood Estimation (MLE)
+# ============================================================
+
+if (!is.null(target_cls)) {
+
+  # Build classification formula (same numeric predictors)
+  cls_formula <- as.formula(
+    paste(target_cls, "~", paste(reg_predictors, collapse = " + "))
+  )
+
+  # --- 7.1  Fit standard logistic regression ---
+  logit_full <- glm(cls_formula, data = train_df, family = binomial(link = "logit"))
+
+  cat("\n===== LOGISTIC REGRESSION SUMMARY =====\n")
+  print(summary(logit_full))
+
+  # Tidy output with ODDS RATIOS
+  tidy_logit <- tidy(logit_full, exponentiate = TRUE, conf.int = TRUE) %>%
+    rename(odds_ratio = estimate) %>%
+    mutate(significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ ""
+    ))
+  print(kable(tidy_logit, caption = "Logistic Regression — Odds Ratios", digits = 4))
+
+  # --- 7.2  Pseudo-R² (McFadden) ---
+  # No direct R² in logistic; McFadden's ρ² = 1 - (LogL_full / LogL_null)
+  # ρ² > 0.2 is generally considered good fit
+  null_logit  <- glm(as.formula(paste(target_cls, "~ 1")),
+                      data = train_df, family = binomial)
+  mcfadden_r2 <- 1 - (logLik(logit_full) / logLik(null_logit))
+  cat(sprintf("\nMcFadden's Pseudo-R²: %.4f\n", as.numeric(mcfadden_r2)))
+
+  # --- 7.3  Hosmer-Lemeshow goodness-of-fit ---
+  # Tests whether observed event rates match predicted probabilities
+  # H₀: model fits well  |  p > 0.05 desired
+  prob_train <- fitted(logit_full)
+  y_bin_train <- as.numeric(train_df[[target_cls]]) - 1
+  hl_test <- hoslem.test(y_bin_train, prob_train, g = 10)
+  cat("\nHosmer-Lemeshow test:\n")
+  print(hl_test)
+
+  # --- 7.4  Regularised Logistic — Lasso path ---
+  X_cls_train <- model.matrix(cls_formula, data = train_df)[, -1]
+  y_cls_train <- as.numeric(train_df[[target_cls]]) - 1
+  X_cls_test  <- model.matrix(cls_formula, data = test_df)[, -1]
+  y_cls_test  <- as.numeric(test_df[[target_cls]]) - 1
+
+  cv_lasso_cls <- cv.glmnet(X_cls_train, y_cls_train,
+                              alpha  = 1,
+                              family = "binomial",
+                              nfolds = 10,
+                              type.measure = "auc")   # optimise AUC not deviance
+  cat("\nLasso Logistic — optimal λ:", cv_lasso_cls$lambda.min,
+      "| CV-AUC:", round(max(cv_lasso_cls$cvm), 4), "\n")
+
+  # --- 7.5  Linear Discriminant Analysis (LDA) ---
+  # LDA assumes Gaussian class-conditional densities + equal covariance matrices.
+  # Equivalent to OLS on dummy-coded outcome when assumptions hold.
+  lda_fit <- lda(cls_formula, data = train_df)
+
+  # --- 7.6  Coefficient plot for logistic model ---
+  tidy_logit_plot <- tidy(logit_full, exponentiate = FALSE, conf.int = TRUE)
+  ggplot(tidy_logit_plot[-1, ], aes(x = reorder(term, estimate),
+                                     y = estimate,
+                                     ymin = conf.low, ymax = conf.high)) +
+    geom_pointrange(colour = "#1a9641") +
+    geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+    coord_flip() +
+    labs(title = "Logistic Regression — Log-Odds Coefficients with 95% CI",
+         x = NULL, y = "Log-Odds Estimate")
+
+} else {
+  cat("No binary target identified. Classification section skipped.\n")
+}
+```
+
+# Classification Evaluation & ROC Analysis
+
+```{r classification-evaluation, message=FALSE, warning=FALSE, fig.width=10, fig.height=8}
+# ============================================================
+#  SECTION 8 — EVALUATING CLASSIFICATION MODELS
+#
+#  Metrics covered:
+#    • Confusion Matrix   — TP, FP, TN, FN counts
+#    • Accuracy           — (TP+TN)/N  [misleading when classes imbalanced]
+#    • Precision          — TP/(TP+FP) [of predicted positives, how many correct?]
+#    • Recall/Sensitivity — TP/(TP+FN) [of actual positives, how many caught?]
+#    • F1-Score           — harmonic mean of Precision & Recall
+#    • AUC-ROC            — area under ROC curve; 0.5=random, 1=perfect
+#    • AUC-PR             — precision-recall AUC (better for imbalanced data)
+# ============================================================
+
+if (!is.null(target_cls)) {
+
+  # ---- Threshold optimisation ----
+  # Default threshold = 0.5, but optimal threshold maximises F1 or Youden's J
+  cls_probs_logit <- predict(logit_full, newdata = test_df, type = "response")
+  cls_probs_lasso <- as.vector(predict(cv_lasso_cls, newx = X_cls_test,
+                                        s = cv_lasso_cls$lambda.min, type = "response"))
+  cls_probs_lda   <- predict(lda_fit, newdata = test_df)$posterior[, 2]
+
+  # Function: confusion matrix + metrics at a given threshold
+  eval_cls <- function(probs, y_true, threshold = 0.5, model_name = "Model") {
+    preds <- factor(ifelse(probs >= threshold, 1, 0), levels = c(0, 1))
+    y_fac <- factor(y_true, levels = c(0, 1))
+    cm    <- confusionMatrix(preds, y_fac, positive = "1")
+    data.frame(
+      Model     = model_name,
+      Threshold = threshold,
+      Accuracy  = round(cm$overall["Accuracy"], 4),
+      Precision = round(cm$byClass["Precision"], 4),
+      Recall    = round(cm$byClass["Recall"], 4),
+      F1        = round(cm$byClass["F1"], 4),
+      Specificity = round(cm$byClass["Specificity"], 4),
+      Kappa     = round(cm$overall["Kappa"], 4)
+    )
+  }
+
+  # Find optimal threshold for logistic model via Youden's J = Sens + Spec - 1
+  roc_logit <- roc(y_cls_test, cls_probs_logit, quiet = TRUE)
+  youden_idx <- which.max(roc_logit$sensitivities + roc_logit$specificities - 1)
+  opt_thresh  <- roc_logit$thresholds[youden_idx]
+  cat(sprintf("\nOptimal threshold (Youden's J): %.3f\n", opt_thresh))
+
+  # Evaluate all models
+  cls_metrics_df <- bind_rows(
+    eval_cls(cls_probs_logit, y_cls_test, 0.5,       "Logistic (0.5)"),
+    eval_cls(cls_probs_logit, y_cls_test, opt_thresh, paste0("Logistic (", round(opt_thresh,2), ")")),
+    eval_cls(cls_probs_lasso, y_cls_test, 0.5,       "Lasso Logistic"),
+    eval_cls(cls_probs_lda,   y_cls_test, 0.5,       "LDA")
+  )
+
+  cat("\n===== CLASSIFICATION MODEL COMPARISON =====\n")
+  print(kable(cls_metrics_df, caption = "Test-Set Classification Metrics") %>%
+          kable_styling(bootstrap_options = c("striped", "hover", "condensed")))
+
+  # --- 8.2  ROC Curves (all models overlaid) ---
+  roc_lasso <- roc(y_cls_test, cls_probs_lasso, quiet = TRUE)
+  roc_lda   <- roc(y_cls_test, cls_probs_lda,   quiet = TRUE)
+
+  roc_df <- bind_rows(
+    data.frame(model = paste0("Logistic AUC=", round(auc(roc_logit), 3)),
+               fpr = 1 - roc_logit$specificities, tpr = roc_logit$sensitivities),
+    data.frame(model = paste0("Lasso AUC=",    round(auc(roc_lasso), 3)),
+               fpr = 1 - roc_lasso$specificities, tpr = roc_lasso$sensitivities),
+    data.frame(model = paste0("LDA AUC=",      round(auc(roc_lda),   3)),
+               fpr = 1 - roc_lda$specificities,   tpr = roc_lda$sensitivities)
+  )
+
+  p_roc <- ggplot(roc_df, aes(x = fpr, y = tpr, colour = model)) +
+    geom_line(linewidth = 1.1) +
+    geom_abline(linetype = "dashed", colour = "grey50") +
+    annotate("point",
+             x = 1 - roc_logit$specificities[youden_idx],
+             y = roc_logit$sensitivities[youden_idx],
+             colour = "black", size = 3, shape = 17) +
+    labs(title    = "ROC Curves — All Classification Models",
+         subtitle = "▲ = Optimal threshold by Youden's J",
+         x = "False Positive Rate (1 - Specificity)",
+         y = "True Positive Rate (Sensitivity)",
+         colour = "Model") +
+    scale_colour_manual(values = c("#d7191c", "#2c7bb6", "#1a9641"))
+
+  print(p_roc)
+
+  # --- 8.3  Detailed confusion matrix for best model ---
+  best_cls_model <- cls_metrics_df$Model[which.max(cls_metrics_df$F1)]
+  cat("\nBest classification model (by F1):", best_cls_model, "\n")
+
+  best_probs <- if (grepl("Lasso", best_cls_model)) cls_probs_lasso else cls_probs_logit
+  best_thr   <- if (grepl(as.character(round(opt_thresh, 2)), best_cls_model)) opt_thresh else 0.5
+  best_preds_cls <- factor(ifelse(best_probs >= best_thr, 1, 0), levels = c(0, 1))
+
+  cm_best <- confusionMatrix(best_preds_cls, factor(y_cls_test, levels = c(0, 1)), positive = "1")
+  print(cm_best)
+
+  # Visualise confusion matrix as heatmap
+  cm_tbl <- as.data.frame(cm_best$table)
+  ggplot(cm_tbl, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+    scale_fill_gradient(low = "#f7f7f7", high = "#2c7bb6") +
+    labs(title = paste("Confusion Matrix —", best_cls_model),
+         fill  = "Count")
+
+} else {
+  cat("No binary target. Section 8 skipped.\n")
+}
+```
+
+# Advanced Topics & Model Comparison
+
+```{r advanced-topics, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+# ============================================================
+#  SECTION 9 — ADVANCED LINEAR MODEL TOPICS
+#
+#  Covered:
+#    A) Interaction terms
+#    B) Polynomial terms (non-linear response via linear model)
+#    C) Robust regression (M-estimators via MASS::rlm)
+#    D) Cross-validated model comparison (caret)
+#    E) Final model selection framework summary
+# ============================================================
+
+# --- 9.A  Interaction Terms ---
+# An interaction β₁₂ X₁X₂ tests whether the effect of X₁ depends on X₂.
+# Useful when predictors are conceptually linked (e.g. income × employment years).
+if (length(reg_predictors) >= 2) {
+  int_vars <- reg_predictors[1:2]
+  int_formula <- as.formula(paste(
+    target_reg_model, "~",
+    paste(reg_predictors, collapse = " + "),
+    "+", paste(int_vars, collapse = ":")   # add one interaction term
+  ))
+  ols_interaction <- lm(int_formula, data = train_df)
+  cat("Interaction term added:", paste(int_vars, collapse=" × "), "\n")
+
+  # Likelihood Ratio Test: is the interaction term significantly improving fit?
+  lrt_interaction <- anova(ols_full, ols_interaction, test = "F")
+  cat("\nLRT — Full vs Interaction model:\n")
+  print(lrt_interaction)
+}
+
+# --- 9.B  Polynomial Regression ---
+# Adding X² captures curvature while staying a *linear* model (linear in parameters).
+# We add poly(X, 2) for the first numeric predictor as illustration.
+poly_var <- reg_predictors[1]
+poly_formula <- as.formula(paste(
+  target_reg_model, "~",
+  paste(setdiff(reg_predictors, poly_var), collapse = " + "),
+  "+ poly(", poly_var, ", 2, raw = FALSE)"   # orthogonal poly reduces collinearity
+))
+ols_poly <- lm(poly_formula, data = train_df)
+cat("\nPolynomial model AIC:", AIC(ols_poly),
+    "| Full OLS AIC:", AIC(ols_full), "\n")
+
+# --- 9.C  Robust Regression (M-estimators) ---
+# MASS::rlm() uses iteratively reweighted least squares (IRWLS)
+# and downweights influential observations/outliers.
+# Use when Shapiro-Wilk / Cook's D flags normality / leverage issues.
+ols_robust <- rlm(ols_formula, data = train_df, method = "MM")
+                  # MM-estimator: high breakdown point (50%) + high efficiency
+cat("\nRobust Regression (MM-estimator) summary:\n")
+print(summary(ols_robust))
+
+# Compare robust vs standard OLS coefficients
+coef_compare <- data.frame(
+  term    = names(coef(ols_full)),
+  OLS     = round(coef(ols_full), 4),
+  Robust  = round(coef(ols_robust), 4),
+  diff    = round(coef(ols_full) - coef(ols_robust), 4)
+) %>% arrange(desc(abs(diff)))
+
+print(kable(head(coef_compare, 10),
+            caption = "Top 10 Largest OLS vs Robust Coefficient Differences"))
+
+# --- 9.D  k-Fold Cross-Validation with caret (unified interface) ---
+# caret::train() wraps any model behind a consistent API,
+# enabling apples-to-apples CV comparison across model families.
+ctrl <- trainControl(
+  method      = "cv",
+  number      = 10,
+  verboseIter = FALSE,
+  returnData  = FALSE
+)
+
+# OLS via caret
+caret_ols   <- train(ols_formula, data = train_df,
+                     method    = "lm",
+                     trControl = ctrl)
+
+# Ridge via caret (glmnet family, fixed α=0)
+ridge_grid  <- expand.grid(alpha = 0, lambda = cv_ridge$lambda.min)
+caret_ridge <- train(ols_formula, data = train_df,
+                     method    = "glmnet",
+                     trControl = ctrl,
+                     tuneGrid  = ridge_grid,
+                     preProc   = NULL)   # already scaled
+
+# Lasso via caret
+lasso_grid  <- expand.grid(alpha = 1, lambda = cv_lasso$lambda.min)
+caret_lasso <- train(ols_formula, data = train_df,
+                     method    = "glmnet",
+                     trControl = ctrl,
+                     tuneGrid  = lasso_grid)
+
+# Collect resampling results
+cv_results <- resamples(list(OLS = caret_ols,
+                              Ridge = caret_ridge,
+                              Lasso = caret_lasso))
+
+cat("\n===== 10-FOLD CV MODEL COMPARISON =====\n")
+print(summary(cv_results))
+
+dotplot(cv_results,
+        main = "10-Fold CV — RMSE and R² Distribution Across Models")
+```
+
+# Conclusions & Final Summary
+
+```{r conclusions, message=FALSE, warning=FALSE}
+# ============================================================
+#  SECTION 10 — SYNTHESIS & DECISION FRAMEWORK
+#
+#  This cell consolidates all findings and provides a
+#  reproducible model-selection rationale.
+# ============================================================
+
+cat("
+╔══════════════════════════════════════════════════════════════╗
+║         LINEAR MODELS STUDY — CONSOLIDATED FINDINGS         ║
+╚══════════════════════════════════════════════════════════════╝
+
+REGRESSION MODELS
+─────────────────
+")
+
+print(kable(reg_comparison %>% arrange(RMSE),
+            caption = "Regression Models Ranked by Test RMSE"))
+
+if (!is.null(target_cls)) {
+  cat("\nCLASSIFICATION MODELS\n─────────────────────\n")
+  print(kable(cls_metrics_df %>% arrange(desc(F1)),
+              caption = "Classification Models Ranked by F1"))
+}
+
+cat("
+MODEL SELECTION GUIDELINES (APPLIED HERE)
+──────────────────────────────────────────
+1. START with OLS full model as baseline; inspect VIF & diagnostics.
+2. APPLY stepwise AIC to reduce complexity without overfitting.
+3. USE Lasso when:  p >> n  OR  many predictors expected irrelevant.
+4. USE Ridge when:  multicollinearity is high (VIF > 5).
+5. USE Elastic Net when:  groups of correlated predictors exist.
+6. USE Robust (rlm) when:  outliers/heavy-tailed errors detected.
+7. USE Interaction/Poly terms when:  domain knowledge or residual
+    patterns suggest non-linear/synergistic effects.
+8. VALIDATE all choices with held-out test set (not CV alone).
+9. REPORT both in-sample fit AND generalisation (test) metrics.
+10. INTERPRET coefficients causally ONLY when data is experimental;
+    observational data → associations, not causal claims.
+
+FST WORKFLOW TAKEAWAYS
+──────────────────────
+• FST provided lossless compression and multi-threaded read/write.
+• For repeated model iterations on large data, FST is the
+  preferred serialisation format over CSV.
+• Partial-column reads minimise memory footprint in wide datasets.
+
+SESSION INFO
+────────────
+")
+
+print(sessionInfo())
+```
+
+---
+
+*Notebook end. All models evaluated on a strictly held-out test set (20%). Scaling and all preprocessing were fitted on training data only to prevent data leakage.*

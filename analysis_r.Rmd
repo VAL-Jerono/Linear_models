@@ -1,0 +1,55 @@
+---
+title: "Loan Analysis in R (CRISP-DM)"
+output:
+  html_notebook:
+    toc: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 5
+)
+```
+
+## Phase 0: Environment Setup
+
+Install packages once, then load libraries each session.
+
+```{r packages}
+# Run once, then comment this line:
+# install.packages(c("tidyverse", "caret", "GGally", "corrplot", "car", "MASS", "lmtest", "pROC", "rpart", "randomForest"))
+
+library(tidyverse)
+library(caret)
+library(GGally)
+library(corrplot)
+library(car)
+library(MASS)
+library(lmtest)
+library(pROC)
+library(rpart)
+library(randomForest)
+```
+
+## Phase 1: Data Understanding
+
+Load the dataset and inspect structure, missingness, and target balance.
+
+```{r load-data}
+loan_df <- read.csv("loan_data.csv")
+
+dim(loan_df)
+str(loan_df)
+summary(loan_df)
+colSums(is.na(loan_df))
+prop.table(table(loan_df$loan_status))
+```
+
+## Notes
+
+Write findings after each phase before moving to modeling.

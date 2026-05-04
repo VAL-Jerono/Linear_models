@@ -1,0 +1,602 @@
+---
+title: "Loan Data Analysis & Modeling"
+subtitle: "A Teaching Guide for R Beginners in RStudio"
+author: "Valerie Jerono"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# This block runs silently when you knit the document.
+# include=FALSE means it won't appear in the output.
+knitr::opts_chunk$set(
+  echo    = TRUE,   # show code in output
+  message = FALSE,  # hide package messages
+  warning = FALSE   # hide warnings
+)
+```
+
+---
+
+> **Before you start:** Open this file in RStudio. You can run each code chunk  
+> by clicking the green ▶ button on its top-right, or press **Ctrl+Shift+Enter**  
+> (Windows/Linux) / **Cmd+Shift+Enter** (Mac). To produce the full HTML report,  
+> click **Knit** in the toolbar at the top.
+
+---
+
+## 1 · Setup: Installing & Loading Packages
+
+> **📘 What is a package?**  
+> R's base installation is powerful, but the R community has written thousands of  
+> *packages* (add-ons) that extend it. You install a package once with  
+> `install.packages()`, then load it each session with `library()`.  
+>  
+> Think of it like: installing an app on your phone (once) vs. opening it (every time).
+
+```{r install-packages, eval=FALSE}
+# Run this block ONCE to install all required packages.
+# After installation, you never need to run install.packages() again
+# for these packages on your computer.
+
+install.packages(c(
+  "tidyverse",  # Collection of data science tools (ggplot2, dplyr, tidyr, etc.)
+  "caret",      # Classification And REgression Training — machine learning toolkit
+  "corrplot",   # Visualising correlation matrices
+  "car",        # Companion to Applied Regression (includes VIF function)
+  "MASS",       # Modern Applied Statistics (includes stepAIC)
+  "ROCR"        # ROC curves for classifier evaluation
+))
+```
+
+```{r load-libraries}
+# Load packages every time you open a new R session.
+# library() makes the package's functions available in your environment.
+
+library(tidyverse)  # loads ggplot2, dplyr, tidyr, readr, and more
+library(caret)
+library(corrplot)
+library(car)
+library(MASS)
+library(ROCR)
+library(dplyr)      # loaded by tidyverse, but we call it explicitly for clarity
+```
+
+> **📘 Why does tidyverse load so many things?**  
+> `tidyverse` is a "meta-package" — a curated collection. When you run  
+> `library(tidyverse)`, it silently loads ~8 packages at once, saving you time.
+
+---
+
+## 2 · Load & Explore the Dataset
+
+> **📘 Assigning variables with `<-`**  
+> In R, the assignment operator is `<-` (not `=`). It means "store the result  
+> on the right into the name on the left". You can read `data <- read.csv(...)` as  
+> *"data gets the CSV file"*. Keyboard shortcut: **Alt + –** (Windows) / **Option + –** (Mac).
+
+```{r load-data}
+# Read the CSV file into a data frame called 'data'.
+# A data frame is R's version of a spreadsheet/table — rows are observations,
+# columns are variables.
+
+# ⚠️  Update this path to wherever your loan_data.csv is saved on YOUR computer.
+# Example on Windows: "C:/Users/YourName/Downloads/loan_data.csv"
+# Example on Mac:     "/Users/YourName/Downloads/loan_data.csv"
+
+data <- read.csv("loan_data.csv")
+
+# head() shows the first 6 rows — a quick peek at the structure
+head(data)
+```
+
+```{r summarise-data}
+# summary() gives descriptive statistics for every column:
+#   - For numeric columns: min, max, mean, median, quartiles
+#   - For character/factor columns: frequency counts
+
+summary(data)
+```
+
+> **📘 Reading the summary output**  
+> - **Min / Max**: the smallest and largest values in that column  
+> - **Mean**: the average (sum divided by count)  
+> - **Median**: the middle value when sorted — less sensitive to outliers than mean  
+> - **1st Qu. / 3rd Qu.**: the 25th and 75th percentile values  
+>  
+> When Mean >> Median, the data is *right-skewed* (a few very large values pull  
+> the mean up). This is common for income data, which we will address later.
+
+---
+
+## 3 · Data Cleaning
+
+### 3.1 Check for Missing Values
+
+> **📘 `colSums(is.na(...))`**  
+> - `is.na(data)` produces a TRUE/FALSE table — TRUE wherever a value is missing  
+> - `colSums(...)` sums each column (TRUE = 1, FALSE = 0)  
+> - Result: count of missing values per column
+
+```{r missing-values}
+# Count missing values in each column.
+# A result of 0 for every column means the data is complete — no gaps to fill.
+colSums(is.na(data))
+```
+
+### 3.2 Convert Categorical Columns to Factors
+
+> **📘 What is a `factor`?**  
+> R has a special data type for *categorical* variables called a **factor**.  
+> A factor stores distinct categories (called *levels*) and encodes them  
+> internally as integers. This matters for modelling — when R sees a factor,  
+> it knows to create *dummy variables* automatically (more on this soon).  
+>  
+> Without conversion, R would treat a column like `person_gender` as plain text  
+> and most modelling functions would either error or ignore it.
+
+```{r convert-factors}
+# Convert each categorical column from character to factor.
+# Syntax: data$column_name  accesses a single column from a data frame.
+
+data$person_gender              <- as.factor(data$person_gender)
+data$person_education           <- as.factor(data$person_education)
+data$person_home_ownership      <- as.factor(data$person_home_ownership)
+data$loan_intent                <- as.factor(data$loan_intent)
+data$previous_loan_defaults_on_file <- as.factor(data$previous_loan_defaults_on_file)
+
+# loan_status is our classification target: 0 = did not default, 1 = defaulted
+data$loan_status                <- as.factor(data$loan_status)
+
+# Verify the changes — factor columns now show levels instead of raw text
+summary(data)
+```
+
+---
+
+## 4 · Exploratory Data Analysis (EDA)
+
+### 4.1 Correlation Matrix
+
+> **📘 What is correlation?**  
+> Correlation measures the *linear* relationship between two numeric variables.  
+> - **+1**: perfect positive relationship (as X increases, Y increases)  
+> - **-1**: perfect negative relationship (as X increases, Y decreases)  
+> - **0**: no linear relationship  
+>  
+> **Why does it matter?** Highly correlated *predictor* variables (correlation > 0.8)  
+> can cause *multicollinearity* in regression models — we will check for this later.
+
+```{r correlation-matrix, fig.width=8, fig.height=7}
+# Step 1: Keep only numeric columns — cor() can't handle factors or text.
+# The pipe operator %>% means "take the result and pass it to the next function".
+# dplyr::select() specifies we want select() from dplyr (avoids name conflicts).
+# where(is.numeric) is a helper that picks columns satisfying is.numeric.
+
+numeric_data <- data %>% dplyr::select(where(is.numeric))
+
+# Step 2: Compute the correlation matrix
+cor_matrix <- cor(numeric_data)
+
+# Step 3: Visualise with corrplot
+# method = "color" fills each cell with a colour proportional to the correlation.
+# Blue = positive correlation, Red = negative correlation.
+corrplot(cor_matrix, method = "color",
+         tl.cex = 0.8,    # text label size
+         tl.col = "black") # text label colour
+```
+
+> **🔍 What to look for:**  
+> - `person_age` ↔ `person_emp_exp`: very high correlation (~0.82) — these variables  
+>   measure similar things. This will show up as *multicollinearity* in the model.  
+> - `loan_amnt` ↔ `loan_percent_income`: moderate positive correlation (~0.64).
+
+### 4.2 Income Distribution
+
+> **📘 `hist()` — Histogram**  
+> A histogram splits a numeric variable into equal-width *bins* and counts how  
+> many observations fall into each bin. It reveals the *shape* of the distribution.
+
+```{r income-histogram, fig.width=7, fig.height=5}
+hist(data$person_income,
+     breaks = 30,                  # number of bins
+     main   = "Income Distribution",
+     xlab   = "Annual Income",
+     col    = "#7c6fff",
+     border = "white")
+
+# Add a vertical line at the mean and median to see the skew
+abline(v = mean(data$person_income),   col = "red",   lwd = 2, lty = 2)
+abline(v = median(data$person_income), col = "green", lwd = 2, lty = 2)
+legend("topright",
+       legend = c("Mean", "Median"),
+       col    = c("red", "green"),
+       lty    = 2, lwd = 2)
+```
+
+> **🔍 Interpretation:**  
+> The distribution is **right-skewed** — most people earn low-to-moderate income,  
+> with a long tail of high earners. The mean is pulled right of the median.  
+>  
+> **Why this matters:** Linear regression assumes residuals are normally distributed.  
+> A skewed *target variable* often violates this. The fix: **log transformation**.
+
+---
+
+## 5 · Linear Regression — Predicting Income
+
+> **📘 What is linear regression?**  
+> Linear regression fits a straight-line relationship between a target variable Y  
+> (what we want to predict) and one or more predictor variables X:  
+>  
+> `Y = β₀ + β₁X₁ + β₂X₂ + ... + ε`  
+>  
+> The model *learns* the β coefficients (slopes) that minimise prediction error.  
+> In R, you describe this relationship with a **formula**: `target ~ predictors`.  
+> Using `.` as the predictor means "use all other columns".
+
+### 5.1 Train/Test Split
+
+> **📘 Why split the data?**  
+> We train the model on one portion of data and evaluate it on an *unseen* portion.  
+> This tests whether the model *generalises* rather than just memorising training data  
+> (a problem called *overfitting*).
+
+```{r train-test-split}
+set.seed(123)
+# set.seed() ensures randomness is reproducible — run this code on any computer
+# and you'll get the same split. The number 123 is arbitrary; any integer works.
+
+# createDataPartition() from caret splits indices proportionally.
+# p = 0.8 means 80% goes to training.
+# list = FALSE returns a plain vector of row numbers, not a list.
+train_index <- createDataPartition(data$person_income, p = 0.8, list = FALSE)
+
+# Subset the data using the indices:
+# data[train_index, ]  — rows in train_index,  all columns
+# data[-train_index, ] — rows NOT in train_index (the minus sign = "exclude")
+train <- data[train_index, ]
+test  <- data[-train_index, ]
+
+cat("Training rows:", nrow(train), "\n")
+cat("Test rows    :", nrow(test),  "\n")
+```
+
+### 5.2 Fit Baseline Linear Model
+
+```{r baseline-linear-model}
+# lm() = linear model
+# Formula: person_income ~ .  means: predict income using ALL other columns
+# data = train: fit on training data only
+
+lm_model <- lm(person_income ~ ., data = train)
+
+summary(lm_model)
+```
+
+> **📘 Reading the `summary()` output:**  
+> - **Coefficients table**: each row is one predictor. The `Estimate` column is  
+>   the β coefficient — how much Y changes for a 1-unit increase in that X.  
+>   `***` stars mean the predictor is statistically significant (p < 0.001).  
+> - **R-squared**: proportion of variance in Y explained by the model.  
+>   R² = 0.29 means the model explains **29%** of income variation — not great.  
+> - **Residual Std. Error**: average prediction error in the same units as Y (income).
+
+### 5.3 Check Regression Assumptions
+
+> **📘 The 4 plots from `plot(model)`:**  
+> 1. **Residuals vs Fitted** — checks linearity. Points should be randomly scattered  
+>    around the horizontal line (no pattern = good).  
+> 2. **Normal Q-Q** — checks normality of residuals. Points should follow the diagonal  
+>    line. Deviations at the tails indicate non-normality.  
+> 3. **Scale-Location** — checks homoscedasticity (equal variance). A flat line is good.  
+> 4. **Residuals vs Leverage** — identifies influential outliers.
+
+```{r check-assumptions, fig.width=8, fig.height=8}
+# par(mfrow = c(2,2)) divides the plotting window into a 2×2 grid.
+# The next 4 plots will fill each panel in order.
+par(mfrow = c(2, 2))
+plot(lm_model)
+```
+
+```{r vif-check}
+# VIF = Variance Inflation Factor — measures multicollinearity.
+# A VIF > 10 is a sign of serious multicollinearity.
+# When two predictors are highly correlated, the model can't reliably
+# estimate their individual effects.
+
+vif(lm_model)
+```
+
+> **🔍 Findings:**  
+> - `person_age` (GVIF ≈ 14.1) and `person_emp_exp` (GVIF ≈ 11.4) are highly  
+>   correlated — the model struggles to separate their effects.  
+> - The Q-Q plot shows non-normal residuals — a consequence of skewed income.  
+> - **Solution**: log-transform the target variable.
+
+---
+
+## 6 · Transformations
+
+### 6.1 Apply Log Transform
+
+> **📘 Why log-transform?**  
+> `log()` compresses large values and expands small ones, turning a right-skewed  
+> distribution into something closer to a normal distribution.  
+> This satisfies regression's normality assumption and often dramatically improves R².  
+>  
+> **Trade-off**: predictions will be on the *log scale*. You must `exp()` them  
+> back to the original scale to interpret results in actual dollars.
+
+```{r log-transform}
+# Add a new column log_income to both train and test.
+# log() in R is the natural logarithm (base e).
+train$log_income <- log(train$person_income)
+test$log_income  <- log(test$person_income)
+
+# Quick check — the distribution should now look more symmetric
+hist(train$log_income,
+     breaks = 30,
+     main   = "Log-Income Distribution",
+     xlab   = "log(Annual Income)",
+     col    = "darkgreen",
+     border = "white")
+```
+
+### 6.2 Refit with Log Income
+
+```{r refit-log-model}
+# Formula:  log_income ~ . - person_income
+# The minus sign ( - person_income ) REMOVES person_income from the predictors.
+# We exclude it because log_income is derived from it — including both would
+# be circular (and perfectly correlated).
+
+lm_model_log <- lm(log_income ~ . - person_income, data = train)
+
+summary(lm_model_log)
+```
+
+> **🔍 R² jumped from 0.29 → 0.77!**  
+> The log transformation fixed the skewness and the model now explains  
+> ~77% of income variance. This is a *huge* improvement from a simple fix.
+
+### 6.3 Check Assumptions Again
+
+```{r assumptions-log, fig.width=8, fig.height=8}
+par(mfrow = c(2, 2))
+plot(lm_model_log)
+
+vif(lm_model_log)
+```
+
+---
+
+## 7 · Model Evaluation
+
+> **📘 Metrics for regression:**  
+> - **RMSE** (Root Mean Squared Error): average error in original units. Penalises  
+>   large errors more severely because errors are squared before averaging.  
+> - **MAE** (Mean Absolute Error): average of absolute errors. More intuitive —  
+>   "on average, our predictions are off by MAE dollars".  
+> Lower is better for both.
+
+```{r evaluate-linear-model}
+# Step 1: Predict on the test set (data the model has never seen)
+# newdata = test tells predict() to use the test data frame
+pred <- predict(lm_model_log, newdata = test)
+
+# Step 2: Back-transform from log scale to original income scale
+# exp() is the inverse of log() — exp(log(x)) = x
+pred_exp <- exp(pred)
+
+# Step 3: Calculate error metrics
+RMSE <- sqrt(mean((test$person_income - pred_exp)^2))
+MAE  <- mean(abs(test$person_income - pred_exp))
+
+cat("RMSE:", round(RMSE, 2), "\n")
+cat("MAE :", round(MAE,  2), "\n")
+```
+
+> **🔍 Interpretation:**  
+> MAE ≈ 16,591 means the model's predictions are off by about **$16,591** on  
+> average. Whether that's acceptable depends on the business context.
+
+---
+
+## 8 · Stepwise Regression (Model Selection)
+
+> **📘 What is stepwise regression?**  
+> Stepwise regression automates variable selection. It iteratively adds or removes  
+> predictors based on the **AIC** (Akaike Information Criterion) — a measure that  
+> balances model fit against complexity. Lower AIC = better model.  
+>  
+> `direction = "both"` means the algorithm can both add and remove variables at  
+> each step (also called *bidirectional elimination*).
+
+```{r stepwise, results='hide'}
+# stepAIC() is from the MASS package.
+# It prints a step-by-step log as it runs — suppressed here with results='hide'
+# to keep output clean. Remove that chunk option to see the full log.
+step_model <- stepAIC(lm_model_log, direction = "both")
+```
+
+```{r stepwise-summary}
+summary(step_model)
+```
+
+> **🔍 Result:**  
+> Stepwise removed `credit_score`, `person_gender`, and `previous_loan_defaults_on_file`  
+> without changing R². These variables were not adding meaningful predictive power.  
+> The simpler model is preferred — fewer variables = easier to interpret and deploy.
+
+---
+
+## 9 · Classification Model — Predicting Loan Default
+
+> **📘 What is logistic regression?**  
+> Despite the name, logistic regression is a *classification* algorithm.  
+> Instead of predicting a continuous number, it predicts the **probability** that  
+> an observation belongs to a class (here: probability of loan default).  
+>  
+> We use `glm()` (Generalised Linear Model) with `family = "binomial"` — this  
+> tells R we are modelling a binary outcome (0 or 1).
+
+### 9.1 Fit the Logistic Model
+
+```{r logistic-model}
+# Target: loan_status (0 = no default, 1 = default)
+# We exclude person_income (raw) because we already have log_income.
+# family = "binomial" activates the logistic regression link function.
+
+log_model <- glm(loan_status ~ . - person_income,
+                 data   = train,
+                 family = "binomial")
+
+summary(log_model)
+```
+
+> **📘 Reading the logistic regression summary:**  
+> - Coefficients are on the *log-odds* scale (not directly interpretable as probabilities).  
+> - `exp(coef(log_model))` converts them to **odds ratios** — more interpretable.  
+> - **AIC**: like in stepwise — lower is better. Use to compare models.  
+> - **Null vs Residual deviance**: a large drop (null − residual) means the predictors  
+>   are explaining a lot of variation in the outcome.
+
+### 9.2 Predictions & Confusion Matrix
+
+> **📘 The threshold (0.5):**  
+> `predict(..., type = "response")` returns probabilities between 0 and 1.  
+> We need to convert these to class labels using a threshold.  
+> `ifelse(prob > 0.5, 1, 0)` means: "predict default if probability > 50%".  
+> You can adjust this threshold to trade off sensitivity vs. specificity.
+
+```{r confusion-matrix}
+# type = "response" returns probabilities (not log-odds)
+prob       <- predict(log_model, newdata = test, type = "response")
+
+# Convert probabilities to binary predictions using 0.5 threshold
+pred_class <- ifelse(prob > 0.5, 1, 0)
+
+# confusionMatrix() from caret compares predictions vs. true labels
+confusionMatrix(as.factor(pred_class), test$loan_status)
+```
+
+> **📘 Confusion Matrix explained:**  
+>  
+> |                  | Predicted: No Default | Predicted: Default |  
+> |------------------|-----------------------|--------------------|  
+> | **Actual: No Default** | True Negative (TN)  | False Positive (FP) |  
+> | **Actual: Default**    | False Negative (FN)  | True Positive (TP)  |  
+>  
+> - **Accuracy** = (TP + TN) / total = 89.8% — correct predictions overall  
+> - **Sensitivity** = TP / (TP + FN) = 93.8% — % of actual defaults correctly caught  
+> - **Specificity** = TN / (TN + FP) = 76.0% — % of actual non-defaults correctly identified  
+>  
+> **High sensitivity** is often more important in lending — missing a default is  
+> more costly than wrongly flagging a good borrower.
+
+### 9.3 ROC Curve
+
+> **📘 What is the ROC Curve?**  
+> The **Receiver Operating Characteristic** curve plots sensitivity (true positive rate)  
+> vs. 1 − specificity (false positive rate) at every possible threshold.  
+>  
+> A model that randomly guesses falls on the diagonal. A perfect model hits the  
+> top-left corner. The **AUC** (Area Under the Curve) summarises performance:  
+> - AUC = 0.5: no better than random  
+> - AUC = 1.0: perfect  
+> - AUC > 0.9: excellent
+
+```{r roc-curve, fig.width=6, fig.height=6}
+# prediction() and performance() are from the ROCR package.
+# They create objects that know how to plot themselves.
+pred_obj <- prediction(prob, test$loan_status)
+perf     <- performance(pred_obj, "tpr", "fpr")
+
+plot(perf,
+     col     = "#7c6fff",
+     lwd     = 2,
+     main    = "ROC Curve — Loan Default Classifier",
+     xlab    = "False Positive Rate (1 - Specificity)",
+     ylab    = "True Positive Rate (Sensitivity)")
+
+# Reference line: what a random classifier would look like
+abline(a = 0, b = 1, col = "grey50", lty = 2)
+
+# Calculate and display AUC
+auc <- performance(pred_obj, "auc")@y.values[[1]]
+legend("bottomright",
+       legend = paste0("AUC = ", round(auc, 3)),
+       col    = "#7c6fff", lty = 1, lwd = 2)
+```
+
+---
+
+## 10 · Feature Engineering
+
+> **📘 What is feature engineering?**  
+> Feature engineering means creating *new* columns (features) from existing ones  
+> that might be more informative for a model. Good features capture domain  
+> knowledge — for example, "income relative to experience" captures *productivity*  
+> in a way that raw income or experience alone do not.
+
+```{r feature-engineering}
+# Feature 1: income per year of experience
+# Adding 1 prevents division by zero for people with 0 experience
+data$income_per_experience <- data$person_income / (data$person_emp_exp + 1)
+
+# Feature 2: loan amount as a fraction of credit score
+# Higher ratio = potentially riskier loan relative to creditworthiness
+data$loan_to_credit_ratio  <- data$loan_amnt / data$credit_score
+
+# Inspect the new features
+summary(data[, c("income_per_experience", "loan_to_credit_ratio")])
+```
+
+> **💡 Next steps:**  
+> After engineering features, you would re-run the train/test split  
+> (including the new columns) and refit your models to see if performance improves.
+
+---
+
+## 11 · Summary & Key Takeaways
+
+```{r summary-table, echo=FALSE}
+summary_df <- data.frame(
+  Step     = c("Baseline Linear Regression",
+               "Linear (after log transform)",
+               "Stepwise Linear (AIC selection)",
+               "Logistic Regression"),
+  Metric   = c("R² = 0.293",
+               "R² = 0.767",
+               "R² = 0.767 (simpler model)",
+               "Accuracy = 89.8%, AUC ≈ 0.93"),
+  Key_Lesson = c("Skewed targets hurt model fit",
+                 "Log transform: huge improvement",
+                 "Fewer variables can be equally good",
+                 "Classification: accuracy + AUC")
+)
+
+knitr::kable(summary_df,
+             col.names = c("Model", "Performance", "Key Lesson"),
+             caption   = "Model Comparison")
+```
+
+---
+
+> **🎓 R Concepts Covered:**  
+> `<-` assignment · `library()` · `read.csv()` · `head()` · `summary()` ·  
+> `as.factor()` · `%>%` pipe · `dplyr::select()` · `cor()` · `corrplot()` ·  
+> `hist()` · `set.seed()` · `createDataPartition()` · `lm()` · `glm()` ·  
+> `par(mfrow)` · `plot(model)` · `vif()` · `log()` · `exp()` · `predict()` ·  
+> `stepAIC()` · `ifelse()` · `confusionMatrix()` · `prediction()` · `performance()`
+
+---
+
+*Knit this document to HTML with the **Knit** button in RStudio to see the full formatted report.*

@@ -1,0 +1,108 @@
+---
+title: '222331'
+output: html_document
+date: "2026-04-14"
+
+---
+Questions:
+- How can a combination of time series analysis, econometric models, demographic data, industry trends, and machine learning improve labour market forecasting?
+- How can standardizing sector classifications and harmonizing survey methodologies improve the comparability of employment data across multiple countries?
+- Use the input data for Colombia on the municipality level (“colombia_input.fst”) and create a plot that visualizes the relationship between population density (“raster_pop_100”) and light intensity recorded at night (“night_lights_100”). Interpret your graph.
+- Train a suitable (ML) model to predict population density and visualize the population density in Quindío. Explain the graph
+---
+---
+1. ***How can a combination of time series analysis, econometric models, demographic data, industry trends, and machine learning improve labour market forecasting?***
+
+- Labour market has a lot of variables th
+
+***Time Series Analysis*** - When we study employment patterns over time,observe if it has increased or decreased, the trend, seasonality and the pattern, This will help us make predictions whenevber we have similar trends as before.
+---
+***Econometrics Models*** - The economy has its own models, ed demand, supply or even recession, when we study how these factors affect the labor market, we can use the same conclusions to make a summary of another market facing same conditions. Eg effect os a natural calamity to th labor industry eg covid 19.
+---
+***Demographic data*** - As population increases, labor market gains more competition, which will result to many workers with few positions/jobs. When we sudy how population fluctations affects the labor market, we can make useful prdictions, that will be used in analysing a different market.
+---
+
+***Industry Trends***  - For example, use of AI to automate tasks has ended up rendering many people jobless, studying how this trend has affected the labor market will be useful in analysing how this will go over time, eg if AI use rises from 70% to 90%, how different will the market be?
+
+---
+***Machine Learning*** - Linear models can combine these different variables on a Linear Model, and create predictions useful in telling whether an individual is employed or unemployed, or even compare the current and future employablility state of two diffent nations, eg Kenya and Tanzania. 
+
+---
+
+---
+***How can standardizing sector classifications and harmonizing survey methodologies improve the comparability of employment data across multiple countries?***
+
+- By standardizing, we will make the distribution of our datasets almost similar, or better yet more normal. This will help our models make uniform predictions, not biased and also accurate.
+- For example, if all our datasets use same scale during collection, it will give us a uniform predictions in terms of R squared for regression and Recall for Classification.
+- Moreso, if we have completely different collection, cleaning and modeling, the predictions produced will end up varying wildly, and therefore giving inaccurate findings.
+
+---
+3. ***Use the input data for Colombia on the municipality level (“colombia_input.fst”) and create a plot that visualizes the relationship between population density (“raster_pop_100”) and light intensity recorded at night (“night_lights_100”). Interpret your graph.***
+---
+
+
+---
+# DATA INGESTION 
+---
+```{r}
+library(dplyr)
+library(tidyverse)
+library(corrr)
+library(corrplot)
+library(MASS)
+library(e1071)
+library(corrr)
+library(pROC)
+library(plotROC)
+library(fst)
+library(finalfit)
+library(gbm)
+library(glmnet)
+library(data.table)
+```
+
+
+```{r}
+#Full reload from FST
+data <- read_fst("colombia_input.fst")
+```
+
+
+```{r}
+summary(data)
+```
+
+
+```{r}
+names(data)
+
+```
+
+
+```{r}
+
+numeric_vars  <- names(data)[sapply(data, is.numeric)]
+numeric_vars
+```
+
+
+```{r}
+#hist('raster_pop_100')
+```
+```{r}
+#barplot("raster_pop_100","night_lights_100")
+```
+---
+***Train a suitable (ML) model to predict population density and visualize the population density in Quindío. Explain the graph***
+---
+
+```{r}
+#Full reload from FST
+data_q <- read_fst("quindio_input_grid.fst")
+```
+
+```{r}
+summary(data_q)
+```
+
+
